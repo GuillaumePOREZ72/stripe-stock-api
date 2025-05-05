@@ -1,0 +1,76 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Customer {
+  id             Int      @id @default(autoincrement())
+  stripeCustomerId String   @unique // ID du client dans Stripe
+  email          String   @unique
+  name           String?
+  orders         Order[]
+
+  @@map("customers") 
+}
+
+model Product {
+  id              Int      @id @default(autoincrement())
+  name            String
+  stock           Int      @default(0) @db.Int 
+  prices          Price[]
+  orderItems      OrderItem[]
+
+  @@map("products")
+}
+
+model Price {
+  id           Int    @id @default(autoincrement())
+  stripePriceId String @unique // ID du prix dans Stripe
+  currency     String @default("eur")
+  productId    Int
+  product      Product @relation(fields: [productId], references: [id])
+  orderItems   OrderItem[]
+
+  @@map("prices")
+}
+
+enum OrderStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+  REFUNDED
+
+}
+
+model Order {
+  id              Int         @id @default(autoincrement())
+  stripeSessionId String      @unique
+  customerId      Int
+  customer        Customer    @relation(fields: [customerId], references: [id])
+  status          OrderStatus @default(PENDING)
+  total           Float
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  items           OrderItem[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id        Int     @id @default(autoincrement())
+  orderId   Int
+  order     Order   @relation(fields: [orderId], references: [id])
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+  priceId   Int
+  price     Price   @relation(fields: [priceId], references: [id])
+  quantity  Int
+  amount Float
+
+  @@map("order_items")
+}
