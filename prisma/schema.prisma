@@ -50,6 +50,7 @@ enum OrderStatus {
 model Order {
   id              Int         @id @default(autoincrement())
   stripeSessionId String      @unique
+  stripeInvoiceId String?
   customerId      Int
   customer        Customer    @relation(fields: [customerId], references: [id])
   status          OrderStatus @default(PENDING)

@@ -15,7 +15,8 @@ export class CreateCheckoutSessionDto {
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => CheckoutItemDto)
-  items: { productId: number; quantity: number }[];
+  @IsNotEmpty()
+  items: CheckoutItemDto[];
 
   @IsNumber()
   @IsOptional()
