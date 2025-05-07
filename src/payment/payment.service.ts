@@ -99,149 +99,118 @@ export class PaymentService {
   }
 
   // Méthode pour les webhooks
-  async handleWebhook(signature: string, rawBody: Buffer) {
-    let event: Stripe.Event;
+  async handleWebhook(signature: string, rawBody: Buffer): Promise<{ received: true }> {
+    const event = this.stripe.webhooks.constructEvent(
+      rawBody,
+      signature,
+      this.webhookSecret,
+    );
 
-    try {
-      event = this.stripe.webhooks.constructEvent(
-        rawBody,
-        signature,
-        this.webhookSecret,
-      );
-      console.log(`✅ Webhook validé: ${event.type}`);
-    } catch (err) {
-      console.error(`❌ Erreur de webhook: ${err.message}`);
-      throw new BadRequestException(`Webhook Error: ${err.message}`);
-    }
+    switch (event.type) {
+      case 'checkout.session.completed':
+        const session = event.data.object as Stripe.Checkout.Session;
 
-    // Traitement des événements de paiement
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object as Stripe.Checkout.Session;
-      console.log(`💰 Paiement réussi! Session ID: ${session.id}`);
-
-      try {
-        // Récupérer les informations de la session
         const lineItems = await this.stripe.checkout.sessions.listLineItems(
           session.id,
           { limit: 100 },
         );
 
-        // Récupérer le customerId depuis les métadonnées
-        let customerId: number | undefined = undefined;
-        if (session.metadata && session.metadata.customerId) {
-          const parsedId = parseInt(session.metadata.customerId);
-          if (!isNaN(parsedId)) {
-            customerId = parsedId;
-          }
-        }
+        const customerId = session.metadata?.customerId
+          ? parseInt(session.metadata.customerId)
+          : undefined;
 
-        // Préparer les items de commande
-        const orderItems: Array<{
-          productId: number;
-          quantity: number;
-          priceId: number;
-          amount: number;
-        }> = [];
-
-        for (const item of lineItems.data) {
-          const priceInDb = await this.prisma.price.findUnique({
+        const orderItems = lineItems.data.flatMap((item) => {
+          const priceInDb = this.prisma.price.findUnique({
             where: { stripePriceId: item.price?.id },
             include: { product: true },
           });
 
-          if (priceInDb?.product) {
-            orderItems.push({
-              productId: priceInDb.product.id,
-              quantity: item.quantity || 1,
-              priceId: priceInDb.id,
-              amount: item.amount_total ? item.amount_total / 100 : 0,
-            });
-
-            // Mettre à jour le stock
-            const newStock = Math.max(
-              0,
-              priceInDb.product.stock - (item.quantity || 0),
-            );
-            await this.prisma.product.update({
-              where: { id: priceInDb.product.id },
-              data: { stock: newStock },
-            });
-            console.log(
-              `✅ Stock mis à jour: ${priceInDb.product.name} → ${newStock}`,
-            );
-          } else {
-            console.log(
-              `⚠️ Produit non trouvé pour le prix: ${item.price?.id}`,
-            );
+          if (!priceInDb || !priceInDb.product) {
+            return [];
           }
-        }
+
+          return {
+            productId: priceInDb.product.id,
+            quantity: item.quantity || 1,
+            priceId: priceInDb.id,
+            amount: item.amount_total ? item.amount_total / 100 : 0,
+          };
+        });
+
+        // Mettre à jour le stock
+        const productsToStockUpdate = orderItems.reduce<Record<number, number>>(
+          (products, item) => {
+            products[item.productId] = Math.max(
+              0,
+              (products[item.productId] || 0) - item.quantity,
+            );
+            return products;
+          },
+          {},
+        );
+
+        await this.prisma.product.updateMany({
+          data: Object.entries(productsToStockUpdate).map(([productId, stock]) => ({
+            id: parseInt(productId),
+            stock,
+          })),
+        });
 
         // S'assurer que les informations du client sont à jour dans Stripe
         if (customerId !== undefined) {
           const customer = await this.prisma.customer.findUnique({
-            where: { id: customerId }
+            where: { id: customerId },
           });
-          
+
           if (customer && customer.stripeCustomerId) {
-            // Mettre à jour les informations du client dans Stripe
             await this.stripe.customers.update(customer.stripeCustomerId, {
               email: customer.email,
               name: customer.name || undefined,
               metadata: {
-                customerId: customer.id.toString()
-              }
+                customerId: customer.id.toString(),
+              },
             });
-            console.log(`Informations du client ${customer.name} mises à jour dans Stripe`);
           }
         }
 
         // Créer la commande dans la base de données
-        const orderData = {
-          stripeSessionId: session.id,
-          status: 'COMPLETED' as OrderStatus,
-          total: session.amount_total ? session.amount_total / 100 : 0,
-          items: {
-            create: orderItems,
-          },
-        };
-
-        // Ajouter customerId seulement s'il est défini
-        if (customerId !== undefined) {
-          orderData['customerId'] = customerId;
-        }
-
         const order = await this.prisma.order.create({
           data: {
-            ...orderData,
-            customerId: customerId ?? 1,
+            stripeSessionId: session.id,
+            status: 'COMPLETED',
+            total: session.amount_total ? session.amount_total / 100 : 0,
+            items: {
+              create: orderItems,
+            },
+            customerId,
           },
         });
 
-        console.log(`✅ Commande créée: #${order.id}`);
-
         // Génère des factures et les envoie depuis Stripe
         await this.getInvoiceForOrder(order.id);
-      } catch (error) {
-        console.error(`❌ Erreur: ${error.message}`);
-      }
-    }
 
-    // Traitement des événements de remboursement
-    if (event.type === 'charge.refunded') {
-      const charge = event.data.object as Stripe.Charge;
-      console.log(`💸 Remboursement détecté pour la charge: ${charge.id}`);
-    }
+        break;
 
-    if (event.type === 'refund.created') {
-      const refund = event.data.object as Stripe.Refund;
-      console.log(`✅ Remboursement créé: ${refund.id}`);
-    }
+      case 'charge.refunded':
+        const charge = event.data.object as Stripe.Charge;
+        console.log(`Remboursement détecté pour la charge: ${charge.id}`);
+        break;
 
-    if (event.type === 'refund.updated') {
-      const refund = event.data.object as Stripe.Refund;
-      console.log(
-        `🔄 Statut du remboursement mis à jour: ${refund.id} -> ${refund.status}`,
-      );
+      case 'refund.created':
+        const refund = event.data.object as Stripe.Refund;
+        console.log(`Remboursement créé: ${refund.id}`);
+        break;
+
+      case 'refund.updated':
+        const updatedRefund = event.data.object as Stripe.Refund;
+        console.log(
+          `Statut du remboursement mis à jour: ${updatedRefund.id} -> ${updatedRefund.status}`,
+        );
+        break;
+
+      default:
+        console.log(`Événement inconnu: ${event.type}`);
+        return { received: false };
     }
 
     return { received: true };
